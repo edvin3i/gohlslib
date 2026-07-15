@@ -314,7 +314,25 @@ func (s *muxerSegmenter) writeH264(
 
 	dts, err := track.h264DTSExtractor.Extract(au, pts)
 	if err != nil {
-		return fmt.Errorf("unable to extract DTS: %w", err)
+		// mid-stream DTS-extraction failure (e.g. a lost random-access point):
+		// return to the startup wait-for-IDR state instead of killing the muxer,
+		// so decoding re-anchors cleanly on the next IDR.
+		track.firstRandomAccessReceived = false
+		track.h264DTSExtractor = nil
+
+		if !randomAccess {
+			return nil // drop; the guard above drops the rest until the next IDR
+		}
+
+		// failure was on a random-access AU itself: one clean re-anchor attempt.
+		track.firstRandomAccessReceived = true
+		track.h264DTSExtractor = &h264.DTSExtractor{}
+		track.h264DTSExtractor.Initialize()
+
+		dts, err = track.h264DTSExtractor.Extract(au, pts)
+		if err != nil {
+			return fmt.Errorf("unable to extract DTS after re-anchor: %w", err)
+		}
 	}
 
 	if s.variant == MuxerVariantMPEGTS {
