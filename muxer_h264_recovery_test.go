@@ -5,6 +5,8 @@ import (
 	_ "embed"
 	"errors"
 	"io"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,9 +31,15 @@ type recoveryAU struct {
 }
 
 // TestMuxerH264RecoverFromLostIDR feeds the capture above into a muxer. With the
-// fix, the muxer drops access units until the next IDR and re-anchors the DTS
-// extractor, so no WriteH264 call fails and the stream keeps flowing.
+// fix, the muxer drops access units until the next IDR, re-anchors the DTS
+// extractor, and keeps producing output. The test asserts BOTH:
+//   - no WriteH264 call fails (no crash), and
+//   - segments keep being emitted past the gap (a degenerate "drop everything
+//     after an error" fix would pass the first assertion but fail this one).
+//
+// It runs for MPEG-TS and for the low-latency fMP4 variant used in production.
 func TestMuxerH264RecoverFromLostIDR(t *testing.T) {
+	// decode access units from the fixture.
 	r, err := mpegts.NewReader(bytes.NewReader(testTSDroppedIDR))
 	require.NoError(t, err)
 
@@ -60,7 +68,7 @@ func TestMuxerH264RecoverFromLostIDR(t *testing.T) {
 		}
 		require.NoError(t, err)
 	}
-	require.Greater(t, len(aus), 30, "fixture must contain enough access units")
+	require.Greater(t, len(aus), 100, "fixture must contain enough access units")
 
 	// initialize the track from the in-band SPS/PPS.
 	var sps, pps []byte
@@ -84,27 +92,47 @@ func TestMuxerH264RecoverFromLostIDR(t *testing.T) {
 	require.NotNil(t, sps)
 	require.NotNil(t, pps)
 
-	track := &Track{
-		Codec:     &codecs.H264{SPS: sps, PPS: pps},
-		ClockRate: 90000,
-	}
+	mediaPlaylistRe := regexp.MustCompile(`(?m)^(\S+_stream\.m3u8\S*)$`)
 
-	m := &Muxer{
-		Variant:            MuxerVariantMPEGTS,
-		SegmentCount:       30,
-		SegmentMinDuration: 1 * time.Second,
-		Tracks:             []*Track{track},
-	}
-	require.NoError(t, m.Start())
-	defer m.Close()
+	for _, variant := range []struct {
+		name string
+		v    MuxerVariant
+	}{
+		{"mpegts", MuxerVariantMPEGTS},
+		{"lowLatency", MuxerVariantLowLatency},
+	} {
+		t.Run(variant.name, func(t *testing.T) {
+			track := &Track{
+				Codec:     &codecs.H264{SPS: sps, PPS: pps},
+				ClockRate: 90000,
+			}
+			m := &Muxer{
+				Variant:            variant.v,
+				SegmentCount:       30,
+				SegmentMinDuration: 1 * time.Second,
+				Tracks:             []*Track{track},
+			}
+			require.NoError(t, m.Start())
+			defer m.Close()
 
-	written := 0
-	for _, e := range aus {
-		ntp := testTime.Add(time.Duration(e.pts) * time.Second / time.Duration(track.ClockRate))
-		err := m.WriteH264(track, ntp, e.pts, e.au)
-		require.NoError(t, err,
-			"WriteH264 must survive a mid-stream lost IDR (au #%d, pts=%d)", written, e.pts)
-		written++
+			for i, e := range aus {
+				ntp := testTime.Add(time.Duration(e.pts) * time.Second / 90000)
+				require.NoError(t, m.WriteH264(track, ntp, e.pts, e.au),
+					"WriteH264 must survive a mid-stream lost IDR (au #%d, pts=%d)", i, e.pts)
+			}
+
+			// output must continue past the gap.
+			mv, _, err := doRequest(m, "index.m3u8")
+			require.NoError(t, err)
+			match := mediaPlaylistRe.FindStringSubmatch(string(mv))
+			require.NotNil(t, match, "multivariant playlist:\n%s", mv)
+
+			media, _, err := doRequest(m, match[1])
+			require.NoError(t, err)
+			segments := strings.Count(string(media), "#EXTINF")
+			require.GreaterOrEqual(t, segments, 5,
+				"muxer must keep emitting segments past the gap (got %d), media playlist:\n%s",
+				segments, media)
+		})
 	}
-	require.Greater(t, written, 30)
 }
